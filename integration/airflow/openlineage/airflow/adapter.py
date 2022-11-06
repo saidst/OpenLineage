@@ -1,14 +1,16 @@
 # Copyright 2018-2022 contributors to the OpenLineage project
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import logging
 import uuid
 from typing import Optional, Dict, Type
-
 from openlineage.airflow.version import __version__ as OPENLINEAGE_AIRFLOW_VERSION
 from openlineage.airflow.extractors import TaskMetadata
+from airflow.configuration import conf
 
+from openlineage.client.transport.http import HttpConfig, HttpTransport, create_token_provider
 from openlineage.client import OpenLineageClient, OpenLineageClientOptions, set_producer
 from openlineage.client.facet import DocumentationJobFacet, SourceCodeLocationJobFacet, \
     NominalTimeRunFacet, ParentRunFacet, BaseFacet
@@ -19,12 +21,6 @@ import requests.exceptions
 
 _DAG_DEFAULT_OWNER = 'anonymous'
 _DAG_DEFAULT_NAMESPACE = 'default'
-
-_DAG_NAMESPACE = os.getenv('OPENLINEAGE_NAMESPACE', None)
-if not _DAG_NAMESPACE:
-    _DAG_NAMESPACE = os.getenv(
-        'MARQUEZ_NAMESPACE', _DAG_DEFAULT_NAMESPACE
-    )
 
 _PRODUCER = f"https://github.com/OpenLineage/OpenLineage/tree/" \
             f"{OPENLINEAGE_AIRFLOW_VERSION}/integration/airflow"
@@ -40,25 +36,59 @@ class OpenLineageAdapter:
     Adapter for translating Airflow metadata to OpenLineage events,
     instead of directly creating them from Airflow code.
     """
+    _dag_namespace = _DAG_DEFAULT_NAMESPACE
     _client = None
 
-    def get_or_create_openlineage_client(self) -> OpenLineageClient:
-        if not self._client:
+    def __init__(self) -> None:
+        self.configure_namespace()
+        self.configure_openlineage_client()
 
-            # Backcomp with Marquez integration
-            marquez_url = os.getenv('MARQUEZ_URL')
-            marquez_api_key = os.getenv('MARQUEZ_API_KEY')
-            if marquez_url:
-                log.info(f"Sending lineage events to {marquez_url}")
-                self._client = OpenLineageClient(marquez_url, OpenLineageClientOptions(
-                    api_key=marquez_api_key
-                ))
-            else:
-                self._client = OpenLineageClient.from_environment()
+    def configure_namespace(self) -> None:
+        marquez_namespace = os.getenv('MARQUEZ_NAMESPACE')
+        ol_kwargs = self.__get_openlineage_kwargs()
+
+        # Backcomp with Marquez integration
+        if marquez_namespace:
+            self._dag_namespace = marquez_namespace
+        elif ol_kwargs:
+            self._dag_namespace = ol_kwargs.get('namespace', _DAG_DEFAULT_NAMESPACE)
+        else:
+            self._dag_namespace = os.getenv('OPENLINEAGE_NAMESPACE', _DAG_DEFAULT_NAMESPACE)
+
+    def configure_openlineage_client(self) -> OpenLineageClient:
+        marquez_url = os.getenv('MARQUEZ_URL')
+        marquez_api_key = os.getenv('MARQUEZ_API_KEY')
+        ol_kwargs = self.__get_openlineage_kwargs()
+
+        # Backcomp with Marquez integration
+        if marquez_url:
+            log.info(f"Sending lineage events to {marquez_url}")
+            self._client = OpenLineageClient(marquez_url, OpenLineageClientOptions(
+                api_key=marquez_api_key
+            ))
+        elif ol_kwargs:
+            config = HttpConfig(url=ol_kwargs['transport']['url'])
+
+            # config = HttpConfig(url=ol_kwargs['transport']['url'],
+            #                     auth=create_token_provider({
+            #                         "type": "api_key",
+            #                         "api_key": ol_kwargs['transport']['auth']['api_key']
+            #                     }))
+
+            self._client = OpenLineageClient(transport=HttpTransport(config))
+        else:
+            self._client = OpenLineageClient.from_environment()
+
+    def __get_openlineage_kwargs(self) -> Dict:
+        ol_kwargs_raw = conf.get("lineage", "openlineage_kwargs", fallback="{}")
+        ol_kwargs = json.loads(ol_kwargs_raw)
+        return ol_kwargs
+
+    def get_or_create_openlineage_client(self) -> OpenLineageClient:
         return self._client
 
     def build_dag_run_id(self, dag_id, dag_run_id):
-        return str(uuid.uuid3(uuid.NAMESPACE_URL, f'{_DAG_NAMESPACE}.{dag_id}.{dag_run_id}'))
+        return str(uuid.uuid3(uuid.NAMESPACE_URL, f'{self._dag_namespace}.{dag_id}.{dag_run_id}'))
 
     def emit(self, event: RunEvent):
         event = redact_with_exclusions(event)
@@ -103,6 +133,7 @@ class OpenLineageAdapter:
             eventTime=event_time,
             run=self._build_run(
                 run_id,
+                self._dag_namespace,
                 parent_job_name,
                 parent_run_id,
                 job_name,
@@ -111,7 +142,7 @@ class OpenLineageAdapter:
                 run_facets=run_facets
             ),
             job=self._build_job(
-                job_name, job_description, code_location,
+                job_name, self._dag_namespace, job_description, code_location,
                 task.job_facets if task else None
             ),
             inputs=task.inputs if task else None,
@@ -141,10 +172,11 @@ class OpenLineageAdapter:
             eventTime=end_time,
             run=self._build_run(
                 run_id,
+                self._dag_namespace,
                 run_facets=task.run_facets
             ),
             job=self._build_job(
-                job_name, job_facets=task.job_facets
+                job_name, self._dag_namespace, job_facets=task.job_facets
             ),
             inputs=task.inputs,
             outputs=task.outputs,
@@ -171,10 +203,12 @@ class OpenLineageAdapter:
             eventTime=end_time,
             run=self._build_run(
                 run_id,
+                self._dag_namespace,
                 run_facets=task.run_facets
             ),
             job=self._build_job(
-                job_name
+                job_name,
+                self._dag_namespace
             ),
             inputs=task.inputs,
             outputs=task.outputs,
@@ -185,6 +219,7 @@ class OpenLineageAdapter:
     @staticmethod
     def _build_run(
         run_id: str,
+        dag_namespace: str,
         parent_job_name: Optional[str] = None,
         parent_run_id: Optional[str] = None,
         job_name: Optional[str] = None,
@@ -200,7 +235,7 @@ class OpenLineageAdapter:
         if parent_run_id:
             parent_run_facet = ParentRunFacet.create(
                 parent_run_id,
-                _DAG_NAMESPACE,
+                dag_namespace,
                 parent_job_name or job_name
             )
             facets.update({
@@ -216,6 +251,7 @@ class OpenLineageAdapter:
     @staticmethod
     def _build_job(
         job_name: str,
+        dag_namespace: str,
         job_description: Optional[str] = None,
         code_location: Optional[str] = None,
         job_facets: Dict[str, BaseFacet] = None
@@ -233,4 +269,4 @@ class OpenLineageAdapter:
         if job_facets:
             facets = {**facets, **job_facets}
 
-        return Job(_DAG_NAMESPACE, job_name, facets)
+        return Job(dag_namespace, job_name, facets)
